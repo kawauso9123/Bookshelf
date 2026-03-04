@@ -33,6 +33,14 @@ Windows想定
 
 必要ライブラリ
 pip install PyQt6 Pillow PyMuPDF
+
+環境構築（推奨）
+```bash
+./create_environment.sh
+```
+
+`.venv` に仮想環境が作成され、依存関係がインストールされます。
+
 起動方法
 python Bookshelf_share.py
 外部ビューア設定
