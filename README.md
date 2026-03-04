@@ -35,9 +35,6 @@ Windows想定
 pip install PyQt6 Pillow PyMuPDF
 
 環境構築（推奨）
-```bash
-./create_environment.sh
-```
 
 `.venv` に仮想環境が作成され、依存関係がインストールされます。
 
