@@ -1,60 +1,95 @@
-📚 Bookshelf
+# 📚 Bookshelf
 
-サムネイル一覧表示型のシンプルな本棚ビューアです。
-フォルダ管理・外部ビューア連携・DBキャッシュ機能を備えています。
+ローカル/NAS上の自炊書籍（画像フォルダ・ZIP・PDF）を、サムネイル付きで管理・閲覧するための PyQt6 製デスクトップ本棚アプリです。SQLite を使ったメタデータ管理により、検索・絞り込み・お気に入り管理を高速に行えます。
 
-主な機能
+## 概要
 
-📁 フォルダ単位の一覧表示
+- 画像フォルダ / ZIP / PDF の書籍を一覧表示
+- サムネイルを自動生成（ZIP は先頭画像、PDF は1ページ目）
+- ルート配下を「棚モード（階層表示）」と「フラットモード（再帰一覧）」で切り替え
+- ★評価（お気に入り）やタグ抽出、最近追加・未読・重複候補の確認
+- 外部ビューア（例: Honeyview）連携
+- DB（`data/library.sqlite3`）とサムネイルキャッシュ（`data/thumbs`）をローカル保存
 
-🖼 サムネイル表示（画像 / ZIP / PDF）
+## インストール方法
 
-⭐ お気に入り管理
+### 1. Python を用意
 
-🗃 SQLite によるサムネイル保存
+- Python 3.10 以上を推奨
+- Windows 環境を想定
 
-🚀 外部ビューア起動（ソース内指定）
+### 2. リポジトリを取得
 
-🧭 フラット表示 / フォルダ表示切替
+```bash
+git clone <this-repo-url>
+cd Bookshelf
+```
 
-対応形式
+### 3. 仮想環境を作成（任意だが推奨）
 
-画像（jpg / png 等）
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+```
 
-ZIP（先頭画像を使用）
+### 4. 依存パッケージをインストール
 
-PDF（1ページ目を使用）
+```bash
+pip install -r requirements.txt
+```
 
-動作環境
+## 依存関係
 
-Python 3.10 以上
+`requirements.txt` に記載の主要依存関係:
 
-Windows想定
+- PyQt6
+- Pillow
+- PyMuPDF
 
-必要ライブラリ
-pip install PyQt6 Pillow PyMuPDF
+標準ライブラリとして `sqlite3`, `zipfile`, `threading` などを利用しています。
 
-環境構築（推奨）
+## 使用方法
 
-`.venv` に仮想環境が作成され、依存関係がインストールされます。
+### 1. 初期設定（任意）
 
-起動方法
+`Bookshelf_share.py` 先頭の設定値を必要に応じて編集します。
+
+- `DATA_DIR`: DB/キャッシュ保存先（デフォルトは `./data`）
+- `VIEWER_EXE`: 外部ビューア実行ファイルのフルパス
+- `MEMO_FILE_PATH`: メモファイルのパス
+
+### 2. アプリ起動
+
+```bash
 python Bookshelf_share.py
-外部ビューア設定
+```
 
-ソース内の以下を編集してください。
+### 3. ルートフォルダを選択してスキャン
 
-VIEWER_EXE = r"ビューアのフルパス"
+- 起動後に書籍のルートフォルダを選択
+- `Scan` 実行で DB に書籍情報を登録
+- 検索欄・★フィルタ・タグフィルタで絞り込み
 
-未設定の場合は外部起動は無効です。
+## 実行例
 
-データ保存
+```bash
+$ python Bookshelf_share.py
+# GUIが起動
+# 例: D:\Comics をルートに選択して Scan
+# -> ZIP/PDF/画像フォルダがカード表示され、サムネイルが順次生成される
+# -> ★評価や検索ワードで一覧を絞り込める
+```
 
-実行時に data/ フォルダが自動生成されます。
+## データ保存先
 
-thumbnails.db
+初回実行時に `data/` が作成され、以下が保存されます。
 
-キャッシュ画像
+- `data/library.sqlite3` : 書籍メタデータ
+- `data/thumbs/` : 生成済みサムネイル
 
-ライセンス
-✅ MIT License
+## ライセンス
+
+MIT License
