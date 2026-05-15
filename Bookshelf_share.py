@@ -1,19 +1,30 @@
-# Script Name: Bookshelf.py
+# ==============================================================================
+# Script Name: デジタル本棚アプリ (Bookshelf.py)
+# Version    : 2.0 (2026-05-07)
+# Author     : Sora
+#
 # [概要]
 # ローカルまたはNAS上の自炊書籍（画像/PDF/ZIP）を管理・閲覧するためのデジタル本棚アプリケーション。
-# SQLiteデータベースを使用して高速に検索・フィルタリングを行い、
-# 大量の書籍データでもスムーズなブラウジングを実現します。
+# SQLiteデータベースを使用してメタデータを管理し、高速な検索・フィルタリング・タグ付けを実現。
+# 非同期処理によるサムネイル生成で、大量の書籍でもスムーズなブラウジングを提供します。
 #
 # [主な機能]
-# 1. フォルダ階層構造を維持した「棚モード」と、配下すべてを一覧する「フラットモード」の切り替え。
-# 2. 書籍（ZIP/PDF/画像フォルダ）のサムネイル自動生成（非同期処理）。
-# 3. お気に入り（★）機能によるフィルタリング。
-# 4. 外部ビューア（Honeyview）との連携。
-# 5. データベースによる高速なメタデータ管理。
+# 1. 本棚/フラットモード: フォルダ階層を維持した「棚モード」と、配下すべてを一覧する「フラットモード」の切り替え。
+# 2. 高速メタデータ管理: SQLiteデータベースを使用し、書籍情報を高速に検索・フィルタリング。
+# 3. 非同期サムネイル生成: 書籍（ZIP/PDF/画像フォルダ）のサムネイルをバックグラウンドで自動生成。
+# 4. 多彩なフィルタリング: お気に入り（★）、キーワード検索、タグによる絞り込み。
+# 5. 高度なタグ付け機能: 手動タグ、ファイル名からの自動タグ、メモファイルからのインポートに対応したタグ管理。
+# 6. 特殊ビュー: 「最近追加」「未読」「重複（ハッシュ）」「サムネイル破損」などの特殊ビューを提供。
+# 7. フォルダ代表表紙: フォルダの内容を代表する表紙を自動で選択・キャッシュし、高速に表示。
+# 8. 軽量スキャン: フォルダ表示時に差分のみを高速にスキャンする機能（On-demand）。
+# 9. 外部連携: 可能（Honeyview（画像ビューア）との連携、メモファイル(`favorite.txt`)からの作者フォルダ自動★付け。）
 #
 # [開発・動作環境]
 # - Python 3.x / PyQt6
 # - Pillow, PyMuPDF (fitz)
+# - Honeyview (外部ビューアとして使用)
+# ==============================================================================
+
 import os
 import sys
 import time
@@ -53,12 +64,11 @@ import fitz  # PyMuPDF
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # --- データ保存場所 ---
 # スクリプトと同じ場所のdataフォルダに保存する場合:
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# DATA_DIR = os.path.join(BASE_DIR, "data")
 # 固定パスに保存する場合:
-#　DATA_DIR = r"P:\log-folder\Bookshelf"
-
-VIEWER_EXE = r""
-MEMO_FILE_PATH = r""
+DATA_DIR = os.path.join(BASE_DIR, "data")
+VIEWER_EXE = ""
+MEMO_FILE_PATH = ""
 # =========================
 
 APP_NAME = "BooK_Shelf"
@@ -154,6 +164,18 @@ def extract_first_bracket_author(text: str) -> Optional[str]:
 
     return raw
 
+def open_path_external(path: str) -> None:
+    if VIEWER_EXE and os.path.exists(VIEWER_EXE):
+        subprocess.Popen([VIEWER_EXE, path])
+        return
+
+    if sys.platform.startswith("win"):
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
 # -----------------------------
 # DB
 # -----------------------------
@@ -247,6 +269,24 @@ class LibraryDB:
                 PRIMARY KEY(root_id, rel_dir)
             );
             """)
+
+            # --- migration: add missing columns to existing dirs table ---
+            cur.execute("PRAGMA table_info(dirs)")
+            dir_cols = {c["name"] for c in cur.fetchall()}
+
+            missing_dir_cols = {
+                "rep_path": "TEXT",
+                "rep_rating": "INTEGER DEFAULT 0",
+                "rep_star_path": "TEXT",
+                "rep_star_rating": "INTEGER DEFAULT 0",
+                "rep_cached_at": "INTEGER DEFAULT 0",
+                "rep_sig": "TEXT",
+            }
+
+            for col_name, col_def in missing_dir_cols.items():
+                if col_name not in dir_cols:
+                    cur.execute(f"ALTER TABLE dirs ADD COLUMN {col_name} {col_def}")
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dirs_parent ON dirs(root_id, parent_dir);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dirs_name ON dirs(root_id, name);")
 
@@ -261,6 +301,8 @@ class LibraryDB:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_meta_rating ON meta(rating);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_books_root_parent ON books(root_id, parent_dir);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_meta_path_rating ON meta(path, rating);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_books_cover_state ON books(cover_state);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_books_root_cover_state ON books(root_id, cover_state);")
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS dir_meta(
@@ -377,11 +419,12 @@ class LibraryDB:
 
     def upsert_book(self, *, path: str, root_id: int, rel_path: str, parent_dir: str,
                     btype: str, size: int, mtime: int, title: str, autocommit: bool = True,
-                    conn: Optional[sqlite3.Connection] = None, hash_val: Optional[str] = None) -> None:
+                    conn: Optional[sqlite3.Connection] = None, hash_val: Optional[str] = None,
+                    scanned_at: Optional[int] = None) -> None:
         conn = conn or self.conn
         lock = self._scan_lock if conn == self.scan_conn else self._lock
         with lock:
-            now = int(time.time())
+            now = int(scanned_at if scanned_at is not None else time.time())
             cur = conn.cursor()
             cur.execute("""
             INSERT INTO books(path, root_id, rel_path, parent_dir, type, size, mtime, title, last_scanned_at, hash)
@@ -451,11 +494,11 @@ class LibraryDB:
             return cur.fetchone() is not None
 
     def upsert_dir(self, *, root_id: int, rel_dir: str, parent_dir: str, name: str, mtime: int, autocommit: bool = True,
-                   conn: Optional[sqlite3.Connection] = None) -> None:
+                   conn: Optional[sqlite3.Connection] = None, scanned_at: Optional[int] = None) -> None:
         conn = conn or self.conn
         lock = self._scan_lock if conn == self.scan_conn else self._lock
         with lock:
-            now = int(time.time())
+            now = int(scanned_at if scanned_at is not None else time.time())
             cur = conn.cursor()
             cur.execute("""
             INSERT INTO dirs(root_id, rel_dir, parent_dir, name, mtime, last_scanned_at)
@@ -723,6 +766,23 @@ class LibraryDB:
             cur.execute("SELECT cover_thumb_path, cover_sig, cover_state, mtime, size, type FROM books WHERE path=?", (path,))
             return cur.fetchone()
 
+    def list_thumb_plan_rows(self, root_id: int) -> List[sqlite3.Row]:
+        """
+        一括サムネ生成用の候補一覧を返す。
+        ここでは DB 上の状態だけを見て、既存サムネのスキップ判定を行う。
+        実ファイルの exists() を全件で叩かないことで、NAS 上でも確認フェーズを軽くする。
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT path, mtime, size, type, cover_state, cover_thumb_path, cover_sig
+                FROM books
+                WHERE root_id=?
+                  AND type IN ('zip', 'pdf', 'img')
+                ORDER BY parent_dir, title
+            """, (root_id,))
+            return cur.fetchall()
+
     def get_book_rel_path(self, path: str) -> Optional[str]:
         with self._lock:
             cur = self.conn.cursor()
@@ -831,6 +891,91 @@ class LibraryDB:
             WHERE b.root_id=? AND b.hash IN (SELECT hash FROM books WHERE root_id=? AND hash IS NOT NULL GROUP BY hash HAVING COUNT(*) > 1)
             ORDER BY b.hash, b.path
             """, (root_id, root_id))
+            return cur.fetchall()
+
+    def list_broken_child_dirs(self, root_id: int, parent_dir: str, query: str = "") -> List[sqlite3.Row]:
+        with self._lock:
+            self.sql_count += 1
+            q_param = f"%{query.strip()}%" if query.strip() else "%"
+            cur = self.conn.cursor()
+
+            sql = """
+            SELECT d.rel_dir, d.name, d.mtime, COALESCE(dm.rating, 0) as rating
+            FROM dirs d
+            LEFT JOIN dir_meta dm ON dm.root_id=d.root_id AND dm.rel_dir=d.rel_dir
+            WHERE d.root_id=? AND d.parent_dir=?
+              AND EXISTS (
+                  SELECT 1
+                  FROM books b
+                  WHERE b.root_id=d.root_id
+                    AND b.rel_path LIKE d.rel_dir || '\\%'
+                    AND b.cover_state=2
+              )
+            """
+            params = [root_id, parent_dir]
+
+            if query.strip():
+                sql += " AND d.name LIKE ? "
+                params.append(q_param)
+
+            sql += " ORDER BY d.name "
+            cur.execute(sql, tuple(params))
+            return cur.fetchall()
+
+    def list_broken_direct_books(self, root_id: int, dir_rel: str, query: str = "") -> List[sqlite3.Row]:
+        with self._lock:
+            self.sql_count += 1
+            q = f"%{query.strip()}%" if query.strip() else "%"
+            cur = self.conn.cursor()
+
+            cur.execute("""
+            SELECT b.*, COALESCE(m.rating,0) AS rating
+            FROM books b
+            LEFT JOIN meta m ON m.path=b.path
+            WHERE b.root_id=?
+              AND b.parent_dir=?
+              AND b.cover_state=2
+              AND (b.title LIKE ? OR b.rel_path LIKE ?)
+            ORDER BY b.title
+            """, (root_id, dir_rel, q, q))
+            return cur.fetchall()
+
+    def list_broken_books_recursive(self, root_id: int, dir_rel: str, query: str = "") -> List[sqlite3.Row]:
+        with self._lock:
+            self.sql_count += 1
+            q = f"%{query.strip()}%" if query.strip() else "%"
+            like = (dir_rel + r"\%") if dir_rel else "%"
+            cur = self.conn.cursor()
+
+            cur.execute("""
+            SELECT b.*, COALESCE(m.rating,0) AS rating
+            FROM books b
+            LEFT JOIN meta m ON m.path=b.path
+            WHERE b.root_id=?
+              AND b.rel_path LIKE ?
+              AND b.cover_state=2
+              AND (b.title LIKE ? OR b.rel_path LIKE ?)
+            ORDER BY b.parent_dir, b.title
+            """, (root_id, like, q, q))
+            return cur.fetchall()
+
+    def list_hidden_books(self, root_id: int, dir_rel: str, query: str = "") -> List[sqlite3.Row]:
+        with self._lock:
+            self.sql_count += 1
+            q = f"%{query.strip()}%" if query.strip() else "%"
+            like = (dir_rel + r"\%") if dir_rel else "%"
+            cur = self.conn.cursor()
+
+            cur.execute("""
+            SELECT b.*, COALESCE(m.rating,0) AS rating
+            FROM books b
+            LEFT JOIN meta m ON m.path=b.path
+            WHERE b.root_id=?
+              AND b.rel_path LIKE ?
+              AND COALESCE(m.rating,0) = -1
+              AND (b.title LIKE ? OR b.rel_path LIKE ?)
+            ORDER BY b.parent_dir, b.title
+            """, (root_id, like, q, q))
             return cur.fetchall()
 
     def ensure_tag(self, name: str, conn: Optional[sqlite3.Connection] = None, autocommit: bool = True) -> int:
@@ -1323,6 +1468,140 @@ class LibraryDB:
             (hash_val, path)
         )
 
+    def _chunked(self, seq, n=500):
+        for i in range(0, len(seq), n):
+            yield seq[i:i+n]
+
+    def list_direct_book_paths(self, root_id: int, parent_dir: str) -> List[str]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT path FROM books WHERE root_id=? AND parent_dir=?",
+                (int(root_id), parent_dir or "")
+            )
+            return [str(r["path"]) for r in cur.fetchall()]
+
+    def list_direct_child_dir_rels(self, root_id: int, parent_dir: str) -> List[str]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT rel_dir FROM dirs WHERE root_id=? AND parent_dir=?",
+                (int(root_id), parent_dir or "")
+            )
+            return [str(r["rel_dir"]) for r in cur.fetchall()]
+
+    def delete_books_by_paths(self, paths: List[str], conn: Optional[sqlite3.Connection] = None,
+                              autocommit: bool = True) -> Set[str]:
+        if not paths:
+            return set()
+
+        conn = conn or self.conn
+        lock = self._scan_lock if conn == self.scan_conn else self._lock
+        affected_dirs: Set[str] = set()
+
+        with lock:
+            cur = conn.cursor()
+
+            for chunk in self._chunked(paths, 400):
+                placeholders = ",".join(["?"] * len(chunk))
+
+                cur.execute(
+                    f"SELECT DISTINCT parent_dir FROM books WHERE path IN ({placeholders})",
+                    tuple(chunk)
+                )
+                for row in cur.fetchall():
+                    affected_dirs.add(str(row["parent_dir"] or ""))
+
+                cur.execute(
+                    f"DELETE FROM book_tags WHERE path IN ({placeholders})",
+                    tuple(chunk)
+                )
+                cur.execute(
+                    f"DELETE FROM books WHERE path IN ({placeholders})",
+                    tuple(chunk)
+                )
+
+            if autocommit:
+                conn.commit()
+
+        return affected_dirs
+
+    def delete_dirs_by_rel_dirs(self, root_id: int, rel_dirs: List[str],
+                                conn: Optional[sqlite3.Connection] = None,
+                                autocommit: bool = True) -> Set[str]:
+        rel_dirs = [d for d in rel_dirs if d != ""]
+        if not rel_dirs:
+            return set()
+
+        conn = conn or self.conn
+        lock = self._scan_lock if conn == self.scan_conn else self._lock
+        affected_parents: Set[str] = set()
+
+        with lock:
+            cur = conn.cursor()
+
+            for chunk in self._chunked(rel_dirs, 400):
+                placeholders = ",".join(["?"] * len(chunk))
+                params = [int(root_id)] + chunk
+
+                cur.execute(
+                    f"SELECT DISTINCT parent_dir FROM dirs WHERE root_id=? AND rel_dir IN ({placeholders})",
+                    tuple(params)
+                )
+                for row in cur.fetchall():
+                    affected_parents.add(str(row["parent_dir"] or ""))
+
+                cur.execute(
+                    f"DELETE FROM dir_meta WHERE root_id=? AND rel_dir IN ({placeholders})",
+                    tuple(params)
+                )
+                cur.execute(
+                    f"DELETE FROM dirs WHERE root_id=? AND rel_dir IN ({placeholders})",
+                    tuple(params)
+                )
+
+            if autocommit:
+                conn.commit()
+
+        return affected_parents
+
+    def purge_missing_after_full_scan(self, root_id: int, scan_started_at: int,
+                                      conn: Optional[sqlite3.Connection] = None,
+                                      autocommit: bool = True) -> Set[str]:
+        conn = conn or self.conn
+        lock = self._scan_lock if conn == self.scan_conn else self._lock
+        affected_dirs: Set[str] = set()
+
+        with lock:
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT path
+                FROM books
+                WHERE root_id=? AND last_scanned_at < ?
+            """, (int(root_id), int(scan_started_at)))
+            missing_book_paths = [str(r["path"]) for r in cur.fetchall()]
+
+            affected_dirs |= self.delete_books_by_paths(
+                missing_book_paths, conn=conn, autocommit=False
+            )
+
+            cur.execute("""
+                SELECT rel_dir
+                FROM dirs
+                WHERE root_id=? AND rel_dir<>'' AND last_scanned_at < ?
+            """, (int(root_id), int(scan_started_at)))
+            missing_dirs = [str(r["rel_dir"]) for r in cur.fetchall()]
+
+            affected_dirs |= self.delete_dirs_by_rel_dirs(
+                int(root_id), missing_dirs, conn=conn, autocommit=False
+            )
+
+            if autocommit:
+                conn.commit()
+
+        return affected_dirs
+
 
 # -----------------------------
 # Scan worker (Phase A)
@@ -1376,6 +1655,7 @@ class ScanJob(QRunnable):
         print(f"[SCAN] start {self.root_path}")
         start = time.perf_counter()
         try:
+            scan_started_at = int(time.time())
             count = 0
             err_count = 0
             dir_count = 0
@@ -1423,7 +1703,8 @@ class ScanJob(QRunnable):
                         name=name,
                         mtime=int(st_dir.st_mtime),
                         autocommit=False,
-                        conn=self.db.scan_conn
+                        conn=self.db.scan_conn,
+                        scanned_at=scan_started_at,
                     ) # upsert_dir
                 except OSError as e:
                     err_count += 1
@@ -1470,7 +1751,8 @@ class ScanJob(QRunnable):
                         title=title,
                         autocommit=False,
                         conn=self.db.scan_conn,
-                        hash_val=fhash
+                        hash_val=fhash,
+                        scanned_at=scan_started_at,
                     ) # upsert_book
 
                     if self.auto_tag:
@@ -1492,6 +1774,20 @@ class ScanJob(QRunnable):
                     self._add_touched_dir(parent_dir)
             
             with self.db._scan_lock:
+                if err_count == 0:
+                    deleted_affected = self.db.purge_missing_after_full_scan(
+                        self.root_id,
+                        scan_started_at,
+                        conn=self.db.scan_conn,
+                        autocommit=False
+                    )
+                    for d in deleted_affected:
+                        self._add_touched_dir(d)
+                else:
+                    self.signals.progress.emit(
+                        f"削除スキップ: scan error が {err_count} 件あるため安全側で保持"
+                    )
+
                 self.db.scan_conn.commit()
 
             # Update representative cover cache for all touched directories
@@ -1540,6 +1836,9 @@ class LightScanJob(QRunnable):
                 self.signals.error.emit(f"フォルダが見つかりません: {abs_dir}")
                 return
 
+            scan_started_at = int(time.time())
+            live_child_dirs: Set[str] = set()
+            live_book_paths: Set[str] = set()
             changed = 0
 
             # 軽スキャンでもトランザクションを切る
@@ -1561,6 +1860,7 @@ class LightScanJob(QRunnable):
 
                     st = ent.stat(follow_symlinks=False)
                     child_rel = name if not self.rel_dir else (self.rel_dir + "\\" + name)
+                    live_child_dirs.add(child_rel)
                     parent_dir = self.rel_dir
 
                     old = self.db.get_dir_row(self.root_id, child_rel)
@@ -1575,7 +1875,8 @@ class LightScanJob(QRunnable):
                             name=name,
                             mtime=cur_mtime,
                             autocommit=False,
-                            conn=self.db.scan_conn
+                            conn=self.db.scan_conn,
+                            scanned_at=scan_started_at,
                         )
                         changed += 1
 
@@ -1590,6 +1891,7 @@ class LightScanJob(QRunnable):
 
                     st = ent.stat(follow_symlinks=False)
                     full = norm(ent.path)
+                    live_book_paths.add(full)
                     rel_path = ent.name if not self.rel_dir else (self.rel_dir + "\\" + ent.name)
                     parent_dir = self.rel_dir
                     title = os.path.splitext(ent.name)[0]
@@ -1612,7 +1914,8 @@ class LightScanJob(QRunnable):
                         title=title,
                         autocommit=False,
                         conn=self.db.scan_conn,
-                        hash_val=None
+                        hash_val=None,
+                        scanned_at=scan_started_at,
                     )
 
                     if self.auto_tag:
@@ -1623,6 +1926,28 @@ class LightScanJob(QRunnable):
                         )
 
                     changed += 1
+
+                db_child_dirs = set(self.db.list_direct_child_dir_rels(self.root_id, self.rel_dir))
+                db_book_paths = set(self.db.list_direct_book_paths(self.root_id, self.rel_dir))
+
+                missing_child_dirs = sorted(db_child_dirs - live_child_dirs)
+                missing_book_paths = sorted(db_book_paths - live_book_paths)
+
+                affected_dirs = set()
+
+                affected_dirs |= self.db.delete_books_by_paths(
+                    missing_book_paths,
+                    conn=self.db.scan_conn,
+                    autocommit=False
+                )
+                affected_dirs |= self.db.delete_dirs_by_rel_dirs(
+                    self.root_id,
+                    missing_child_dirs,
+                    conn=self.db.scan_conn,
+                    autocommit=False
+                )
+
+                changed += len(missing_child_dirs) + len(missing_book_paths)
 
                 with self.db._scan_lock:
                     self.db.scan_conn.commit()
@@ -1817,9 +2142,62 @@ class ThumbJob(QRunnable):
         self.signals.ready.emit(self.book_path)
 
 
+class BulkThumbPlanSignals(QObject):
+    progress = pyqtSignal(str)
+    planned = pyqtSignal(object, int, int)  # paths, total, skipped
+    error = pyqtSignal(str)
+
+
+class BulkThumbPlanJob(QRunnable):
+    def __init__(self, db: LibraryDB, root_id: int):
+        super().__init__()
+        self.db = db
+        self.root_id = root_id
+        self.signals = BulkThumbPlanSignals()
+
+    def _cover_sig(self, row: sqlite3.Row) -> str:
+        return f"v{THUMB_VER}|s{THUMB_SIZE}|t{row['mtime']}|z{row['size']}"
+
+    def run(self) -> None:
+        try:
+            rows = self.db.list_thumb_plan_rows(self.root_id)
+            total = len(rows)
+            if total <= 0:
+                self.signals.progress.emit("全サムネ確認中… 対象 0 件")
+                self.signals.planned.emit([], 0, 0)
+                return
+
+            targets: List[str] = []
+            skipped = 0
+
+            for i, row in enumerate(rows, start=1):
+                cover_sig = self._cover_sig(row)
+                has_valid_thumb_by_db = bool(
+                    row["cover_state"] == 1
+                    and row["cover_sig"] == cover_sig
+                    and row["cover_thumb_path"]
+                )
+
+                if has_valid_thumb_by_db:
+                    skipped += 1
+                else:
+                    targets.append(str(row["path"]))
+
+                if i == 1 or i % 200 == 0 or i == total:
+                    self.signals.progress.emit(
+                        f"全サムネ確認中… {i}/{total}  skip={skipped}  target={len(targets)}"
+                    )
+
+            self.signals.planned.emit(targets, total, skipped)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
 class ThumbManager(QObject):
     thumb_ready = pyqtSignal(str)
     status_changed = pyqtSignal(int, int, int, int)
+    bulk_progress = pyqtSignal(int, int, int, int)  # done, total, skipped, remaining
+    bulk_finished = pyqtSignal(int, int, int)       # done, total, skipped
 
     def __init__(self, db: LibraryDB, cache_dir: str, pool: QThreadPool):
         super().__init__()
@@ -1832,6 +2210,56 @@ class ThumbManager(QObject):
         self.queued: Set[str] = set()
         self.req_count = 0
         self.hit_count = 0
+
+        # 一括サムネ生成は通常キューと分離する。
+        # clear_queue() で消さず、表示用サムネ要求より後順位で流す。
+        self.bulk_active = False
+        self.bulk_queue = deque()
+        self.bulk_queued: Set[str] = set()
+        self.bulk_targets: Set[str] = set()
+        self.bulk_done_paths: Set[str] = set()
+        self.bulk_total = 0
+        self.bulk_done = 0
+        self.bulk_skipped = 0
+
+    def is_bulk_running(self) -> bool:
+        return self.bulk_active
+
+    def start_bulk_fill(self, paths: List[str], skipped: int = 0) -> bool:
+        if self.bulk_active:
+            return False
+
+        norm_paths: List[str] = []
+        seen: Set[str] = set()
+        for p in paths:
+            np = norm(p)
+            if np in seen:
+                continue
+            seen.add(np)
+            norm_paths.append(np)
+
+        self.bulk_active = True
+        self.bulk_queue.clear()
+        self.bulk_queued.clear()
+        self.bulk_targets = set(norm_paths)
+        self.bulk_done_paths = set()
+        self.bulk_total = len(norm_paths)
+        self.bulk_done = 0
+        self.bulk_skipped = int(skipped)
+
+        for p in norm_paths:
+            self.bulk_queue.append(p)
+            self.bulk_queued.add(p)
+
+        self._emit_bulk_status()
+
+        if self.bulk_total <= 0:
+            self._finish_bulk()
+            return True
+
+        self._pump_jobs()
+        self._emit_status()
+        return True
 
     def request(self, path: str) -> None:
         self.req_count += 1
@@ -1858,22 +2286,73 @@ class ThumbManager(QObject):
         job.signals.ready.connect(self._done)
         self.pool.start(job)
 
+    def _pump_jobs(self) -> None:
+        while self.running < MAX_THUMB_JOBS:
+            nxt = None
+
+            while self.queue:
+                cand = norm(self.queue.popleft())
+                self.queued.discard(cand)
+                if cand in self.inflight:
+                    continue
+                nxt = cand
+                break
+
+            if nxt is None and self.bulk_active:
+                while self.bulk_queue:
+                    cand = norm(self.bulk_queue.popleft())
+                    self.bulk_queued.discard(cand)
+                    if cand in self.inflight or cand in self.bulk_done_paths:
+                        continue
+                    nxt = cand
+                    break
+
+            if nxt is None:
+                break
+
+            self._start_job(nxt)
+
     def _done(self, path: str) -> None:
         path = norm(path)
         self.inflight.discard(path)
         self.running = max(0, self.running - 1)
         self.thumb_ready.emit(path)
 
-        while self.running < MAX_THUMB_JOBS and self.queue:
-            nxt = self.queue.popleft()
-            self.queued.discard(nxt)
-            if nxt in self.inflight:
-                continue
-            self._start_job(nxt)
-        
+        if self.bulk_active and path in self.bulk_targets and path not in self.bulk_done_paths:
+            self.bulk_done_paths.add(path)
+            self.bulk_done = len(self.bulk_done_paths)
+            self._emit_bulk_status()
+
+        self._pump_jobs()
         self._emit_status()
 
+        if self.bulk_active and self.bulk_done >= self.bulk_total:
+            self._finish_bulk()
+
+    def _emit_bulk_status(self) -> None:
+        if not self.bulk_active:
+            return
+        remaining = max(0, self.bulk_total - self.bulk_done)
+        self.bulk_progress.emit(self.bulk_done, self.bulk_total, self.bulk_skipped, remaining)
+
+    def _finish_bulk(self) -> None:
+        done = self.bulk_done
+        total = self.bulk_total
+        skipped = self.bulk_skipped
+
+        self.bulk_active = False
+        self.bulk_queue.clear()
+        self.bulk_queued.clear()
+        self.bulk_targets.clear()
+        self.bulk_done_paths.clear()
+        self.bulk_total = 0
+        self.bulk_done = 0
+        self.bulk_skipped = 0
+
+        self.bulk_finished.emit(done, total, skipped)
+
     def clear_queue(self):
+        # 通常表示用キューのみクリアする。一括サムネ生成キューは維持。
         self.queue.clear()
         self.queued.clear()
         self._emit_status()
@@ -2455,6 +2934,9 @@ class MainWindow(QMainWindow):
         self.icons = IconCache()
         self.thumb = ThumbManager(self.db, self.cache_dir, self.pool)
         self.thumb.thumb_ready.connect(self._on_thumb_ready)
+        self.thumb.bulk_progress.connect(self._update_bulk_thumb_status)
+        self.thumb.bulk_finished.connect(self._on_bulk_thumb_finished)
+        self._bulk_thumb_plan_running = False
         
 
         # フォルダ移動後の自動「再描画」(デバウンス付き)
@@ -2467,6 +2949,9 @@ class MainWindow(QMainWindow):
         self.thumb_status_lbl = QLabel("Thumb: -")
         self.statusBar().addPermanentWidget(self.thumb_status_lbl)
         self.thumb.status_changed.connect(self._update_thumb_status)
+
+        self.bulk_thumb_status_lbl = QLabel("全サムネ: -")
+        self.statusBar().addPermanentWidget(self.bulk_thumb_status_lbl)
 
         self.root_path: Optional[str] = None
         self.root_id: Optional[int] = None
@@ -2546,9 +3031,23 @@ class MainWindow(QMainWindow):
         self.btn_duplicates.clicked.connect(self.show_duplicates)
         top.addWidget(self.btn_duplicates, 0)
 
+        self.btn_broken = QPushButton("壊れ")
+        self.btn_broken.setCheckable(True)
+        self.btn_broken.clicked.connect(self.show_broken)
+        top.addWidget(self.btn_broken, 0)
+
+        self.btn_hidden = QPushButton("Hide表示")
+        self.btn_hidden.setCheckable(True)
+        self.btn_hidden.clicked.connect(self.show_hidden)
+        top.addWidget(self.btn_hidden, 0)
+
         self.btn_dup_hash = QPushButton("重複ハッシュ作成")
         self.btn_dup_hash.clicked.connect(self.build_duplicate_hashes)
         top.addWidget(self.btn_dup_hash, 0)
+
+        self.btn_build_thumbs = QPushButton("全サムネ生成")
+        self.btn_build_thumbs.clicked.connect(self.build_all_thumbs)
+        top.addWidget(self.btn_build_thumbs, 0)
 
         self.btn_root = QPushButton("📚本棚")
         self.btn_root.clicked.connect(self.show_root)
@@ -2678,7 +3177,7 @@ class MainWindow(QMainWindow):
         return (None, None, None)
 
     def choose_root(self):
-        default_dir = r"\\192.168.24.202\Books"
+        default_dir = os.path.expanduser("~")
         path = QFileDialog.getExistingDirectory(self, "ルートフォルダを選択", default_dir)
         if path:
             self.set_root(path)
@@ -2693,6 +3192,8 @@ class MainWindow(QMainWindow):
         self.btn_recent.setChecked(False)
         self.btn_unread.setChecked(False)
         self.btn_duplicates.setChecked(False)
+        self.btn_broken.setChecked(False)
+        self.btn_hidden.setChecked(False)
 
     def show_normal(self):
         self._clear_filter_buttons()
@@ -2721,6 +3222,22 @@ class MainWindow(QMainWindow):
         self._clear_filter_buttons()
         self.btn_duplicates.setChecked(True)
         self.view_mode = "duplicates"
+        self.thumb.clear_queue()
+        self.refresh_view()
+        self._schedule_auto_redraw(1000)
+
+    def show_broken(self):
+        self._clear_filter_buttons()
+        self.btn_broken.setChecked(True)
+        self.view_mode = "broken"
+        self.thumb.clear_queue()
+        self.refresh_view()
+        self._schedule_auto_redraw(1000)
+
+    def show_hidden(self):
+        self._clear_filter_buttons()
+        self.btn_hidden.setChecked(True)
+        self.view_mode = "hidden"
         self.thumb.clear_queue()
         self.refresh_view()
         self._schedule_auto_redraw(1000)
@@ -2789,6 +3306,15 @@ class MainWindow(QMainWindow):
             return
 
         path = MEMO_FILE_PATH
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "favorite.txt を選択",
+            os.path.expanduser("~"),
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if not path:
+            return
+
         if not os.path.exists(path):
             QMessageBox.warning(self, "Memo", f"favorite.txt が見つかりません:\n{path}")
             return
@@ -2817,6 +3343,28 @@ class MainWindow(QMainWindow):
 
     def _update_thumb_status(self, q, r, req, hit):
         self.thumb_status_lbl.setText(f"Thumb: Q={q} Run={r} Req={req} Hit={hit}")
+
+    def _update_bulk_thumb_status(self, done: int, total: int, skipped: int, remaining: int):
+        if total <= 0:
+            return
+        self.bulk_thumb_status_lbl.setText(
+            f"全サムネ: {done}/{total} 完了  skip={skipped}  残={remaining}"
+        )
+        self.statusBar().showMessage(
+            f"全サムネ生成中: {done}/{total} 完了 / skip={skipped} / 残={remaining}"
+        )
+
+    def _on_bulk_thumb_finished(self, done: int, total: int, skipped: int):
+        self.btn_build_thumbs.setEnabled(True)
+        self.bulk_thumb_status_lbl.setText(
+            f"全サムネ: 完了 {done}/{total}  skip={skipped}"
+        )
+        self.statusBar().showMessage(
+            f"全サムネ生成完了: {done}/{total} 完了 / skip={skipped}",
+            10000
+        )
+        if self.view_mode == "broken":
+            self.refresh_view()
 
     def force_redraw_visible(self):
         if self.show_redraw_log:
@@ -2864,7 +3412,7 @@ class MainWindow(QMainWindow):
             return
         if not self.auto_light_scan_on_enter:
             return
-        if self.view_mode != "normal":
+        if self.view_mode not in ("normal", "broken"):
             return
 
         now = time.time()
@@ -2957,6 +3505,70 @@ class MainWindow(QMainWindow):
         job.signals.error.connect(on_error)
         self.pool.start(job)
 
+    def build_all_thumbs(self):
+        if not self.root_id:
+            QMessageBox.information(self, "Info", "先にルートを選択してね")
+            return
+
+        if self._bulk_thumb_plan_running or self.thumb.is_bulk_running():
+            QMessageBox.information(self, "Info", "全サムネ生成はすでに実行中です")
+            return
+
+        self._bulk_thumb_plan_running = True
+        self.btn_build_thumbs.setEnabled(False)
+        self.bulk_thumb_status_lbl.setText("全サムネ: 確認中…")
+        self.statusBar().showMessage("全サムネ生成: 既存サムネ確認中…")
+
+        job = BulkThumbPlanJob(self.db, self.root_id)
+
+        def on_progress(msg: str):
+            self.bulk_thumb_status_lbl.setText(msg)
+            self.statusBar().showMessage(msg)
+
+        def on_planned(paths: List[str], total: int, skipped: int):
+            self._bulk_thumb_plan_running = False
+
+            if total <= 0:
+                self.btn_build_thumbs.setEnabled(True)
+                self.bulk_thumb_status_lbl.setText("全サムネ: 対象 0 件")
+                self.statusBar().showMessage("全サムネ生成: 対象 0 件", 5000)
+                return
+
+            if not paths:
+                self.btn_build_thumbs.setEnabled(True)
+                self.bulk_thumb_status_lbl.setText(f"全サムネ: 完了 0/{total}  skip={skipped}")
+                self.statusBar().showMessage(
+                    f"全サムネ生成: 既存サムネのみ（skip={skipped} / total={total}）",
+                    8000
+                )
+                return
+
+            started = self.thumb.start_bulk_fill(paths, skipped=skipped)
+            if not started:
+                self.btn_build_thumbs.setEnabled(True)
+                self.bulk_thumb_status_lbl.setText("全サムネ: 既に実行中")
+                self.statusBar().showMessage("全サムネ生成: すでに実行中です", 5000)
+                return
+
+            self.bulk_thumb_status_lbl.setText(
+                f"全サムネ: 0/{len(paths)} 完了  skip={skipped}  total={total}"
+            )
+            self.statusBar().showMessage(
+                f"全サムネ生成開始: target={len(paths)} skip={skipped} total={total}",
+                8000
+            )
+
+        def on_error(msg: str):
+            self._bulk_thumb_plan_running = False
+            self.btn_build_thumbs.setEnabled(True)
+            self.bulk_thumb_status_lbl.setText("全サムネ: エラー")
+            QMessageBox.critical(self, "Thumb Build Error", msg)
+
+        job.signals.progress.connect(on_progress)
+        job.signals.planned.connect(on_planned)
+        job.signals.error.connect(on_error)
+        self.pool.start(job)
+
     def refresh(self):
         self.refresh_view()
 
@@ -3033,6 +3645,97 @@ class MainWindow(QMainWindow):
             need_tags = self._need_tags_for_view(min_rating, tag_filter)
             tags_map = self.db.get_tags_bulk_for_paths(paths) if need_tags else {}
             items = [BookItem(path=r["path"], title=f"[{r['hash'][:6]}] {r['title']}", rel_path=r["rel_path"], rating=int(r["rating"]), tags=tags_map.get(r["path"], [])) for r in rows]
+            self.book_model.set_items(items)
+            self.view.setModel(self.book_model)
+            ui_time = (time.perf_counter() - t_ui0) * 1000
+
+        elif self.view_mode == "broken":
+            if self._mode_index() == 1:
+                # フラット（壊れ本だけ）
+                rows = self.db.list_broken_books_recursive(self.root_id, self.current_dir_rel, query=q)
+                sql_time = (time.perf_counter() - t_sql0) * 1000
+
+                t_ui0 = time.perf_counter()
+                paths = [r["path"] for r in rows]
+                tags_map = self.db.get_tags_bulk_for_paths(paths)
+                items = [
+                    BookItem(
+                        path=r["path"],
+                        title=r["title"],
+                        rel_path=r["rel_path"],
+                        rating=int(r["rating"]),
+                        tags=tags_map.get(r["path"], [])
+                    )
+                    for r in rows
+                ]
+                self.book_model.set_items(items)
+                self.view.setModel(self.book_model)
+                ui_time = (time.perf_counter() - t_ui0) * 1000
+
+            else:
+                # 棚（壊れ本を含むフォルダ + 直下の壊れ本）
+                dir_rows = self.db.list_broken_child_dirs(self.root_id, parent_dir=self.current_dir_rel, query=q)
+                book_rows = self.db.list_broken_direct_books(self.root_id, dir_rel=self.current_dir_rel, query=q)
+                sql_time = (time.perf_counter() - t_sql0) * 1000
+
+                t_ui0 = time.perf_counter()
+
+                book_paths = [r["path"] for r in book_rows]
+                tags_map = self.db.get_tags_bulk_for_paths(book_paths)
+
+                for d in dir_rows:
+                    rel_dir = d["rel_dir"]
+                    name = d["name"]
+                    dir_star = int(d["rating"])
+
+                    rep2 = self.db.get_dir_rep_path(self.root_id, rel_dir, only_star=False)
+                    rep_path = rep2[0] if rep2 else ""
+                    rep_rating = int(rep2[1]) if rep2 else 0
+                    shown_rating = max(dir_star, rep_rating)
+
+                    dir_items.append(MixedItem(
+                        kind="dir",
+                        title=name if name else "(root)",
+                        tooltip=self._crumb_for(rel_dir),
+                        rel_dir=rel_dir,
+                        rep_path=rep_path,
+                        rating=shown_rating
+                    ))
+
+                for r in book_rows:
+                    book_items.append(MixedItem(
+                        kind="book",
+                        title=r["title"],
+                        tooltip=r["rel_path"],
+                        path=r["path"],
+                        rel_path=r["rel_path"],
+                        rating=int(r["rating"]),
+                        tags=tags_map.get(r["path"], [])
+                    ))
+
+                items = (dir_items + book_items) if SHOW_DIRS_FIRST else (book_items + dir_items)
+                self.mixed_model.set_items(items)
+                self.view.setModel(self.mixed_model)
+                ui_time = (time.perf_counter() - t_ui0) * 1000
+
+        elif self.view_mode == "hidden":
+            rows = self.db.list_hidden_books(self.root_id, self.current_dir_rel, query=q)
+            sql_time = (time.perf_counter() - t_sql0) * 1000
+
+            t_ui0 = time.perf_counter()
+            paths = [r["path"] for r in rows]
+            tags_map = self.db.get_tags_bulk_for_paths(paths)
+
+            items = [
+                BookItem(
+                    path=r["path"],
+                    title=r["title"],
+                    rel_path=r["rel_path"],
+                    rating=int(r["rating"]),
+                    tags=tags_map.get(r["path"], [])
+                )
+                for r in rows
+            ]
             self.book_model.set_items(items)
             self.view.setModel(self.book_model)
             ui_time = (time.perf_counter() - t_ui0) * 1000
@@ -3150,6 +3853,18 @@ class MainWindow(QMainWindow):
                 status_prefix = "重複本"
                 d_count = 0
                 b_count = len(items)
+            elif self.view_mode == "broken":
+                status_prefix = "壊れ候補"
+                if self._mode_index() == 1:
+                    d_count = 0
+                    b_count = len(items)
+                else:
+                    d_count = len(dir_items)
+                    b_count = len(book_items)
+            elif self.view_mode == "hidden":
+                status_prefix = "Hide"
+                d_count = 0
+                b_count = len(items)
             elif self._mode_index() == 1:
                 status_prefix = "フラット" + (f" (Min:{min_rating})" if min_rating > 0 else "") + (f" [Tag:{tag_filter}]" if tag_filter else "")
                 d_count = 0
@@ -3211,6 +3926,12 @@ class MainWindow(QMainWindow):
             self.db.set_rating(path, -1)
             self.refresh_view()
 
+    def unhide_book(self):
+        kind, path, _ = self._selected_item()
+        if kind == "book" and path:
+            self.db.set_rating(path, 0)
+            self.refresh_view()
+
     def edit_tags(self):
         path = self._selected_book_path()
         if not path:
@@ -3254,6 +3975,7 @@ class MainWindow(QMainWindow):
             return
         try:
             subprocess.Popen([VIEWER_EXE, path], shell=False)
+            open_path_external(path)
             self.db.mark_opened(path)
         except Exception as e:
             QMessageBox.critical(self, "Viewer Error", f"起動に失敗:\n{e}")
@@ -3294,6 +4016,7 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
 
             act_open = QAction("Honeyviewで開く", self)
+            act_open = QAction("外部ビューアで開く", self)
             act_open.triggered.connect(lambda: self._open_in_honeyview(sel_path))
             menu.addAction(act_open)
 
@@ -3301,8 +4024,12 @@ class MainWindow(QMainWindow):
             act_select.triggered.connect(lambda: self._select_in_explorer(sel_path))
             menu.addAction(act_select)
             
-            act_hide = QAction("本を隠す (Rating -1)", self)
-            act_hide.triggered.connect(self.hide_book)
+            if cur == -1:
+                act_hide = QAction("Hide解除", self)
+                act_hide.triggered.connect(self.unhide_book)
+            else:
+                act_hide = QAction("Hide", self)
+                act_hide.triggered.connect(self.hide_book)
             menu.addAction(act_hide)
 
             act_tag = QAction("タグを編集...", self)
